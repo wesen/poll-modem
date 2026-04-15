@@ -959,3 +959,252 @@ ssh root@pve "pct exec 300 -- apt-get install -y curl wget git"
 - Install k3s
 - Install ArgoCD
 - Deploy poll-modem
+
+---
+
+## Step 6: Pivot to k3s + ArgoCD — Assessment and Clean Restart
+
+### Prompt Context
+
+**User prompt (verbatim):** (see Step 5 — "ok, let's set up k3s on proxmox and use that as a target for our deployment. 4 cores, 8 GB for starters, setup argocd as well.")
+
+Then: "We're taking over for your little brother that is fast, but careless. Look at the session up until now, and write an assessment of things in the ticket, because we actually want to do things as cleanly as possible."
+
+**Assistant interpretation:** Pause, assess what's actually done vs what's messy, produce an honest accounting, then proceed cleanly.
+
+**Inferred user intent:** Stop accumulating cruft. Get a clear picture before moving forward.
+
+### Assessment Written
+
+Created `reference/02-assessment.md` with full accounting:
+
+**Good:** Standalone repo works. poll-modem tested against real modem. Proxmox accessible. LXC container 300 running with right specs (4 core, 8GB, privileged, nesting/keyctl/fuse). Hetzner reference project provides proven k3s+ArgoCD pattern.
+
+**Bad:** All scripts in `scripts/` are stale (written for LXC-native, not k3s). Diary became a dump of appendices. VM attempt wasted time. Nested SSH instead of `pct exec`. Container was empty — no curl, no k3s, nothing installed.
+
+**Path forward:** Adapt hetzner cloud-init pattern to Proxmox LXC. One clean bootstrap script. Run via `pct exec`. Then GitOps with ArgoCD.
+
+---
+
+## Step 7: Destroy and Recreate Container 300 (Second Time)
+
+### Prompt Context
+
+**User prompt (verbatim):** "delete the current one and recreate based on cloud-init"
+
+**Assistant interpretation:** Destroy container 300, recreate from scratch with proper cloud-init for automated k3s setup.
+
+**Inferred user intent:** Start clean rather than patching the broken container.
+
+### What happened
+
+1. Destroyed container 300:
+```bash
+pct stop 300 && pct destroy 300
+```
+
+2. Attempted `--cicustom user=local:snippets/user-data-k3s.yaml` — **doesn't work for LXC** (only for QEMU VMs). Error: `Unknown option: cicustom`.
+
+3. Created cloud-init YAML at `/var/lib/vz/snippets/user-data-k3s.yaml` on Proxmox anyway (for reference), but fell back to plain `pct create`.
+
+4. Recreated container 300:
+```bash
+pct create 300 local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst \
+  --hostname k3s-server \
+  --memory 8192 \
+  --cores 4 \
+  --rootfs local-lvm:30 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.0.210/24 \
+  --nameserver 192.168.0.1 \
+  --unprivileged 0 \
+  --features nesting=1,keyctl=1,fuse=1 \
+  --start 1
+```
+
+5. Configured SSH access:
+```bash
+# Set root password
+pct exec 300 -- bash -c 'echo root:changeme | chpasswd'
+
+# Enable root login + password auth
+pct exec 300 -- sed -i 's/#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+pct exec 300 -- sed -i 's/#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+pct exec 300 -- systemctl restart ssh
+
+# Push SSH keys from Proxmox host
+cat /root/.ssh/authorized_keys | pct exec 300 -- tee /root/.ssh/authorized_keys
+```
+
+### What didn't work
+- `--cicustom` is VM-only, not available for LXC containers
+- Cloud-init for LXC on Proxmox is limited to `--ciuser`, `--cipassword`, `--sshkeys`, `--ipconfig0`
+
+---
+
+## Step 8: Network — The vmbr0 Gateway Problem
+
+### What happened
+
+After recreating the container, it could ping the Proxmox host (192.168.0.227) but **could not reach the gateway** (192.168.0.1 — the cable modem). This meant no internet access, no DNS resolution, no way to download packages.
+
+### Root cause
+
+The container is on `vmbr0`, which bridges directly to `eno1` (the physical NIC). The container gets a virtual MAC address (`bc:24:11:39:96:7d`). The cable modem at 192.168.0.1 either:
+
+1. **Filters by MAC** — only accepts traffic from known devices, OR
+2. **Has a small ARP table** — doesn't learn/respond to virtual MACs
+
+The Proxmox host itself (with the physical NIC MAC `5c:ba:2c:20:2b:86`) can reach the gateway fine. But the container's virtual MAC is invisible to the cable modem at L2.
+
+### Debugging steps
+
+```bash
+# Container can reach host
+pct exec 300 -- ping -c 2 192.168.0.227  # ✅ works
+
+# Container cannot reach gateway
+pct exec 300 -- ping -c 2 192.168.0.1    # ❌ 100% packet loss
+
+# Host can reach gateway
+ssh root@pve "ping -c 2 192.168.0.1"     # ✅ works
+
+# DNS fails because no route to gateway/nameserver
+pct exec 300 -- curl -sfL https://get.k3s.io  # exit code 6 (DNS failure)
+pct exec 300 -- ping deb.debian.org             # Temporary failure in name resolution
+```
+
+### Fix: Move container to vmbr1 (NAT network)
+
+Proxmox already has `vmbr1` configured for NAT. The config in `/etc/network/interfaces`:
+```
+post-up iptables -t nat -A POSTROUTING -s '192.168.1.0/24' -o vmbr0 -j MASQUERADE
+```
+
+Steps:
+1. Assign IP to vmbr1: `ip addr add 192.168.1.1/24 dev vmbr1`
+2. Reconfigure container: `pct set 300 --net0 name=eth0,bridge=vmbr1,ip=192.168.1.100/24,gw=192.168.1.1`
+3. Reboot container: `pct reboot 300`
+4. Flush ARP: `ip neigh flush 192.168.1.100`
+5. Set DNS: `pct exec 300 -- bash -c 'echo nameserver 8.8.8.8 > /etc/resolv.conf'`
+
+```bash
+# Verify
+pct exec 300 -- ping -c 2 192.168.1.1                    # ✅ works
+pct exec 300 -- curl -sfL https://get.k3s.io -o /dev/null # ✅ INTERNET WORKS
+```
+
+### Important note
+
+The vmbr1 IP (`192.168.1.1/24`) was added with `ip addr add` — this is **not persistent** across reboots. It should be added to `/etc/network/interfaces`:
+```
+auto vmbr1
+iface vmbr1 inet static
+    address 192.168.1.1/24
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+    post-up iptables -t nat -A POSTROUTING -s '192.168.1.0/24' -o vmbr0 -j MASQUERADE
+    post-down iptables -t nat -D POSTROUTING -s '192.168.1.0/24' -o vmbr0 -j MASQUERADE
+```
+
+---
+
+## Step 9: Package Installation
+
+### What happened
+
+After getting internet working, installed required packages.
+
+### First attempt — stale lock
+
+A previous aborted `apt-get` left a stale lock file. The process was gone but the lock remained.
+
+```bash
+pct exec 300 -- apt-get update
+# E: Could not get lock /var/lib/apt/lists/lock. It is held by process 305 (apt-get)
+```
+
+Fix:
+```bash
+pct exec 300 -- kill -9 305
+pct exec 300 -- rm -f /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock
+pct exec 300 -- dpkg --configure -a
+```
+
+### Second attempt — timeout
+
+`pct exec` with `apt-get install` timed out after 120s. The output buffering through nested SSH (`ssh root@pve "pct exec 300 -- apt-get install..."`) caused the connection to hang.
+
+### Third attempt — success
+
+Ran install directly:
+```bash
+ssh root@pve "pct exec 300 -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y curl git jq socat conntrack iptables 2>&1 | tail -10'"
+```
+
+Installed: curl, git, jq, socat, conntrack, iptables.
+
+---
+
+## Step 10: Bootstrap k3s + ArgoCD — In Progress
+
+### What happened
+
+1. Wrote `scripts/bootstrap-k3s.sh` — adapted from hetzner `cloud-init.yaml.tftpl`. Installs k3s (without Traefik), cert-manager, and ArgoCD sequentially.
+
+2. Pushed script to container:
+```bash
+scp bootstrap-k3s.sh root@pve:/tmp/
+pct push 300 /tmp/bootstrap-k3s.sh /tmp/bootstrap-k3s.sh
+```
+
+3. First run attempt — **silent failure**. Script wrote only one line (`Installing k3s...`) then died. Root cause: DNS resolution failure (curl exit code 6). This was before the vmbr1 fix.
+
+4. After vmbr1 fix, re-ran in background:
+```bash
+pct exec 300 -- bash -c 'nohup bash /tmp/bootstrap-k3s.sh > /tmp/bootstrap.log 2>&1 &'
+```
+
+5. k3s installed successfully — v1.34.6+k3s1:
+```
+[INFO]  Using v1.34.6+k3s1 as release
+[INFO]  Downloading binary https://github.com/k3s-io/k3s/releases/download/v1.34.6%2Bk3s1/k3s
+[INFO]  Installing k3s to /usr/local/bin/k3s
+[INFO]  Creating /usr/local/bin/kubectl symlink to k3s
+[INFO]  systemd: Starting k3s
+```
+
+6. k3s is starting — kubelet running, containerd running, waiting for node to become Ready.
+
+### Current state of bootstrap log
+
+```
+[19:22:06] Waiting for k3s node ready...
+```
+
+Still waiting. k3s is in `activating` state, kubelet is running. First start can take 2-3 minutes.
+
+### Container network (final)
+
+| Address | Purpose |
+|---------|---------|
+| Container eth0 | 192.168.1.100/24 |
+| vmbr1 (host) | 192.168.1.1/24 |
+| Gateway | 192.168.1.1 (Proxmox host) |
+| DNS | 8.8.8.8 |
+| NAT | vmbr1 → vmbr0 → eno1 → cable modem |
+
+### Files involved
+
+- `scripts/bootstrap-k3s.sh` — bootstrap script in ticket
+- `/tmp/bootstrap-k3s.sh` — copy pushed into container
+- `/tmp/bootstrap.log` — log inside container
+
+### What's still pending
+
+- k3s node becoming Ready
+- cert-manager installation
+- ArgoCD installation
+- kubeconfig extraction
+- poll-modem K8s manifests
+- ArgoCD Application for poll-modem
