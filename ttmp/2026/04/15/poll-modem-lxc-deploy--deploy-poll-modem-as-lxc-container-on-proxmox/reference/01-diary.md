@@ -1286,3 +1286,217 @@ Installed tailscaled on VM. Needs auth key to join tailnet. Proxmox host (`pve` 
 - ✅ tailscaled installed, waiting for auth key to join
 - ⏳ Need Tailscale auth key to join tailnet
 - ⏳ Then: poll-modem K8s manifests + ArgoCD Application
+
+---
+
+## Step 11: VM Approach — Ubuntu Noble Just Works
+
+### What happened
+
+Abandoned LXC after the kernel module/sysctl/AppArmor/kmsg battle. Created a proper QEMU VM using Ubuntu Noble cloud image (already on Proxmox at `/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img`). It booted first try, cloud-init worked, SSH keys injected, got DHCP from cable modem.
+
+### Why VM worked vs LXC
+
+| Issue | LXC | VM |
+|-------|-----|-----|
+| `/dev/kmsg` | Missing, had to mknod | Exists naturally |
+| `modprobe overlay` | FATAL: module not found | Works (own kernel) |
+| `/proc/sys` writable | Read-only, needed `lxc.mount.auto` | Writable |
+| AppArmor | Confined, needed unconfined | No confinement |
+| cgroup access | Restricted | Full |
+| DHCP from cable modem | Blocked (virtual MAC invisible to gateway) | Works |
+
+### VM setup
+
+```bash
+qm create 301 --name k3s-server \
+  --memory 8192 --cores 4 --cpu host \
+  --net0 virtio,bridge=vmbr0 \
+  --bios ovmf --machine q35 --agent enabled=1
+
+qm importdisk 301 /var/lib/vz/template/iso/noble-server-cloudimg-amd64.img local-lvm
+
+qm set 301 \
+  --scsihw virtio-scsi-pci --scsi0 local-lvm:vm-301-disk-0 \
+  --efidisk0 local-lvm:1,efitype=4m,pre-enrolled-keys=0 \
+  --ide2 local-lvm:cloudinit \
+  --boot order=scsi0 \
+  --serial0 socket --vga serial0 \
+  --ciuser ubuntu --sshkeys /root/.ssh/authorized_keys \
+  --ipconfig0 ip=dhcp
+
+qm resize 301 scsi0 30G
+qm start 301
+```
+
+### Bootstrap result
+
+k3s v1.34.6+k3s1, cert-manager, ArgoCD — all running in ~90 seconds. Zero kernel hacks.
+
+```
+NAME         STATUS   ROLES           AGE   VERSION
+k3s-server   Ready    control-plane   80s   v1.34.6+k3s1
+```
+
+---
+
+## Step 12: Tailscale Join and Direct Access
+
+### What happened
+
+The VM got DHCP IP 192.168.0.43 from the cable modem. SSH worked from Proxmox host but NOT from the dev machine (cable modem doesn't route to virtual MACs at L3). Needed Tailscale for direct access.
+
+1. Installed Tailscale on VM: `curl -fsSL https://tailscale.com/install.sh | sudo sh`
+2. Joined tailnet with auth key: `sudo tailscale up --auth-key=tskey-auth-...`
+3. VM appeared on tailnet as `k3s-server` at `100.97.160.12`
+
+### TLS SAN issue
+
+k3s TLS certificate only included `127.0.0.1` and the local IP. Had to add Tailscale hostname as SAN:
+
+```yaml
+# /etc/rancher/k3s/config.yaml
+tls-san:
+  - k3s-server
+  - k3s-server.tail879302.ts.net
+```
+
+Then `systemctl restart k3s`.
+
+### Kubeconfig
+
+Pulled kubeconfig, replaced `127.0.0.1` with `k3s-server`:
+
+```bash
+scp ubuntu@k3s-server:/etc/rancher/k3s/k3s.yaml ./kubeconfig.yaml
+sed -i 's/127.0.0.1/k3s-server/' kubeconfig.yaml
+KUBECONFIG=./kubeconfig.yaml kubectl get nodes  # ✅ works directly
+```
+
+### Important lesson
+
+**Everything goes through Tailscale.** The cable modem's network only sees the Proxmox host's physical MAC. VMs and containers can't be reached directly from the dev machine without either:
+- Tailscale (what we use)
+- vmbr1 NAT (only outbound, no inbound)
+- Port forwarding on the cable modem (not always available)
+
+---
+
+## Step 13: Cloud-init Template Validation
+
+### What happened
+
+Wrote a proper `cloud-init.yaml` that automates everything we did manually:
+- Package update/upgrade
+- Install ca-certificates, curl, git, jq, qemu-guest-agent
+- Install Tailscale (from official Ubuntu repo)
+- Write k3s config with TLS SANs
+- Install k3s
+- Install cert-manager
+- Install ArgoCD
+- Write `/etc/motd` with summary and ArgoCD password
+
+Wrote `scripts/create-k3s-vm.sh` to automate VM creation.
+
+Destroyed VM 301, recreated from scratch with `--cicustom user=local:snippets/cloud-init-k3s.yaml`.
+
+### Issues found during validation
+
+1. **SSH keys not injected** — `--cicustom` overrides the built-in Proxmox cloud-init SSH key injection. The custom cloud-init must include `ssh_authorized_keys:` explicitly. Fixed by adding both the dev machine ed25519 key AND the Proxmox host's RSA key (Proxmox only has RSA, Ubuntu Noble disables RSA SHA-1 by default).
+
+2. **RSA SHA-1 disabled on Noble** — Proxmox host only has `id_rsa`. Ubuntu 24.04 rejects RSA by default. Workaround: `PubkeyAcceptedAlgorithms +ssh-rsa` in sshd config. Real fix: add both keys to `ssh_authorized_keys`.
+
+3. **Hostname mismatch** — Cloud-init sets hostname to the VM name, but Tailscale registers with whatever hostname the VM has. If the old VM is still on the tailnet, the new one gets a different Tailscale name. Used `--hostname=k3s-proxmox` with `tailscale up`.
+
+4. **TLS SAN needs all hostnames** — The k3s cert needs to include every hostname the API will be accessed as: `k3s-server`, `k3s-proxmox`, their `.tail879302.ts.net` variants, and `ubuntu` (cloud-init default hostname).
+
+### Validation result
+
+After fixes, the full flow is:
+
+```bash
+# 1. Create VM (automated)
+./scripts/create-k3s-vm.sh 301 k3s-server
+
+# 2. Wait ~3 min for cloud-init
+
+# 3. Find IP, SSH in, check /etc/motd
+
+# 4. Join Tailscale
+sudo tailscale up --auth-key=<key>
+
+# 5. Pull kubeconfig
+scp ubuntu@k3s-proxmox:/etc/rancher/k3s/k3s.yaml ./kubeconfig.yaml
+```
+
+---
+
+## Step 14: DNS and Public Access Planning
+
+### What happened
+
+Discussed how to expose services via DNS. The hetzner k3s uses `*.yolo.scapegoat.dev` pointing to a public IP. Our Proxmox VM is behind a cable modem with no public IP.
+
+### DNS infrastructure discovered
+
+- **DNS managed via Terraform** at `~/code/wesen/terraform/dns/zones/scapegoat-dev/envs/prod/`
+- **Provider**: DigitalOcean
+- **Current records**: `*.yolo → 91.98.46.169` (Hetzner), `*.vibez → 89.167.52.236`, etc.
+- Easy to add new subdomains via Terraform
+
+### Decision: `*.crib.scapegoat.dev` via Tailscale Funnel
+
+- `*.crib.scapegoat.dev` — new subdomain for Proxmox homelab
+- Tailscale Funnel — exposes ports publicly through Tailscale's edge network
+- No need to open cable modem ports
+- Automatic TLS from Tailscale
+- Traefik (k3s ingress) routes by hostname inside the cluster
+
+### Not yet implemented
+
+- Need to enable Tailscale Funnel on the VM
+- Need to add DNS record in Terraform
+- Need to re-enable Traefik in k3s
+- Need to create Ingress resources for services
+
+---
+
+## Current State (End of Session)
+
+### Infrastructure
+
+| Resource | Value |
+|----------|-------|
+| VM 301 (k3s-server) | Ubuntu Noble, 4 cores, 8GB RAM, 30GB disk |
+| Tailscale hostname | `k3s-proxmox` at `100.67.90.12` |
+| k3s version | v1.34.6+k3s1 |
+| ArgoCD | Running, admin password in `/root/argocd-password` |
+| cert-manager | Running |
+| Kubeconfig | `../poll-modem/kubeconfig.yaml` (uses `k3s-proxmox` via Tailscale) |
+
+### Files committed
+
+| File | Purpose |
+|------|---------|
+| `cloud-init.yaml` | Full bootstrap template |
+| `scripts/create-k3s-vm.sh` | VM creation automation |
+| `scripts/setup-access.sh` | Tailscale join + kubeconfig pull |
+| `scripts/bootstrap-k3s.sh` | Bootstrap script (used inside cloud-init) |
+| `kubeconfig.yaml` | kubectl access via Tailscale |
+
+### What works
+
+- ✅ VM creation from cloud-init
+- ✅ k3s + cert-manager + ArgoCD auto-bootstrap
+- ✅ Tailscale join
+- ✅ kubectl from dev machine via Tailscale
+- ✅ ArgoCD UI via port-forward
+
+### What's next
+
+- ⏳ Re-enable Traefik for ingress
+- ⏳ Tailscale Funnel for public access
+- ⏳ DNS record for `*.crib.scapegoat.dev`
+- ⏳ poll-modem container image (Dockerfile + GHCR)
+- ⏳ poll-modem ArgoCD Application manifest
+- ⏳ poll-modem K8s Deployment + Service + Ingress
