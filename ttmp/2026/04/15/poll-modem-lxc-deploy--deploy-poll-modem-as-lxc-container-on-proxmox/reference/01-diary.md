@@ -1208,3 +1208,81 @@ Still waiting. k3s is in `activating` state, kubelet is running. First start can
 - kubeconfig extraction
 - poll-modem K8s manifests
 - ArgoCD Application for poll-modem
+
+---
+
+## Step 11: VM Approach — Ubuntu Noble Just Works
+
+### What happened
+
+Abandoned LXC after the kernel module/sysctl/AppArmor/kmsg battle. Created a proper QEMU VM using Ubuntu Noble cloud image (already on Proxmox). It booted first try, cloud-init worked, SSH keys injected, got DHCP from cable modem.
+
+### Why VM worked vs LXC
+
+| Issue | LXC | VM |
+|-------|-----|-----|
+| `/dev/kmsg` | Missing, had to mknod | Exists naturally |
+| `modprobe overlay` | FATAL: module not found | Works (own kernel) |
+| `/proc/sys` writable | Read-only, needed `lxc.mount.auto` | Writable |
+| AppArmor | Confined, needed unconfined | No confinement |
+| cgroup access | Restricted | Full |
+| DHCP from cable modem | Blocked (virtual MAC) | Works |
+
+### VM setup
+
+```bash
+qm create 301 --name k3s-server \
+  --memory 8192 --cores 4 --cpu host \
+  --net0 virtio,bridge=vmbr0 \
+  --bios ovmf --machine q35 --agent enabled=1
+
+qm importdisk 301 /var/lib/vz/template/iso/noble-server-cloudimg-amd64.img local-lvm
+
+qm set 301 \
+  --scsihw virtio-scsi-pci --scsi0 local-lvm:vm-301-disk-0 \
+  --efidisk0 local-lvm:1,efitype=4m,pre-enrolled-keys=0 \
+  --ide2 local-lvm:cloudinit \
+  --boot order=scsi0 \
+  --serial0 socket --vga serial0 \
+  --ciuser ubuntu --sshkeys /root/.ssh/authorized_keys \
+  --ipconfig0 ip=dhcp
+
+qm resize 301 scsi0 30G
+qm start 301
+```
+
+### Bootstrap result
+
+k3s v1.34.6+k3s1, cert-manager, ArgoCD — all running in ~90 seconds. Zero kernel hacks needed.
+
+```
+NAME         STATUS   ROLES           AGE   VERSION
+k3s-server   Ready    control-plane   80s   v1.34.6+k3s1
+```
+
+All ArgoCD pods: Running. All cert-manager pods: Running.
+
+One non-fatal warning: `The CustomResourceDefinition "applicationsets.argoproj.io" is invalid: metadata.annotations: Too long` — ArgoCD still works fine.
+
+### Network
+
+VM got DHCP IP `192.168.0.43` from cable modem on vmbr0. SSH works from Proxmox host but NOT from dev machine (cable modem MAC filtering). Need Tailscale for direct access.
+
+### ArgoCD credentials
+
+- Password: (stored in cluster, retrieve via kubectl)
+- Kubeconfig saved: `/tmp/kubeconfig-k3s-proxmox.yaml`
+
+### Tailscale
+
+Installed tailscaled on VM. Needs auth key to join tailnet. Proxmox host (`pve` at 100.81.254.116) and dev machine (`f` at 100.72.131.20) are already on tailnet. Hetzner k3s-demo-1 (100.73.36.123) also on tailnet.
+
+### Current state
+
+- ✅ VM 301 running Ubuntu Noble
+- ✅ k3s Ready
+- ✅ cert-manager Running
+- ✅ ArgoCD Running
+- ✅ tailscaled installed, waiting for auth key to join
+- ⏳ Need Tailscale auth key to join tailnet
+- ⏳ Then: poll-modem K8s manifests + ArgoCD Application
