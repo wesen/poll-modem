@@ -470,3 +470,327 @@ pct exec 200 -- docker run hello-world
 ### Summary
 
 Proxmox **can** run Docker, but it's typically done inside LXC or VMs rather than natively. For a single Go application like poll-modem, native LXC is simpler and more integrated. For multi-service apps, "Docker in LXC" gives you the best of both worlds.
+
+---
+
+## Appendix: Running k3s on Proxmox
+
+k3s is a lightweight Kubernetes distribution perfect for homelabs and edge deployments. On Proxmox, you can run k3s in several configurations.
+
+### What is k3s?
+
+- Lightweight K8s (single binary <100MB)
+- Replaces etcd with SQLite (or external DB)
+- Includes ingress, metrics, service LB out of the box
+- CNCF certified Kubernetes
+- Created by Rancher (now SUSE)
+
+### Option 1: k3s in a Single VM (Simplest)
+
+Best for: Single-node clusters, homelabs, learning
+
+```bash
+# Create VM on Proxmox
+qm create 300 --name k3s-server --memory 4096 --cores 2 --net0 virtio,bridge=vmbr0
+qm importdisk 300 /path/to/debian-12-nocloud-amd64.img local-lvm
+qm set 300 --scsihw virtio-scsi-pci --scsi0 local-lvm:vm-300-disk-0
+qm set 300 --ide2 local-lvm:cloudinit
+qm set 300 --boot order=scsi0
+qm set 300 --serial0 socket --vga serial0
+qm start 300
+
+# Inside VM - install k3s
+curl -sfL https://get.k3s.io | sh -
+
+# Verify
+kubectl get nodes
+kubectl get pods -A
+```
+
+**Resources:** 2-4 vCPU, 4-8GB RAM, 20GB disk
+
+### Option 2: k3s in LXC (Lightweight)
+
+Best for: Resource-constrained setups, testing
+
+⚠️ **Limitations:**
+- No kube-proxy (uses iptables/nftables)
+- Limited CSI support
+- Some K8s features may not work
+
+```bash
+# Create privileged LXC (required for k3s)
+pct create 300 local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst \
+  --hostname k3s-node \
+  --memory 4096 \
+  --cores 2 \
+  --rootfs local-lvm:20 \
+  --net0 ip=dhcp,bridge=vmbr0 \
+  --unprivileged 0 \
+  --features nesting=1,keyctl=1,fuse=1 \
+  --mount type=bind,source=/dev/kmsg,destination=/dev/kmsg
+
+pct start 300
+
+# Inside container - fix kernel modules and install
+pct exec 300 -- bash -c "
+  # k3s needs these
+  modprobe br_netfilter 2>/dev/null || true
+  sysctl -w net.ipv4.ip_forward=1
+  sysctl -w net.bridge.bridge-nf-call-iptables=1
+  
+  # Install k3s without traefik (optional)
+  curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC='--disable traefik' sh -
+"
+
+# Get kubeconfig
+pct exec 300 -- cat /etc/rancher/k3s/k3s.yaml
+```
+
+### Option 3: k3s HA Cluster (Production-Ready)
+
+Best for: Production workloads, high availability
+
+**Architecture:**
+```
+Proxmox Cluster
+├── VM 301: k3s-server-1 (control-plane + etcd)
+├── VM 302: k3s-server-2 (control-plane + etcd)
+├── VM 303: k3s-server-3 (control-plane + etcd)
+├── VM 304: k3s-agent-1 (worker)
+└── VM 305: k3s-agent-2 (worker)
+```
+
+**Setup external datastore (required for HA):**
+```bash
+# Option A: SQLite (only for single server)
+# Option B: PostgreSQL (for HA)
+# Option C: MySQL (for HA)
+# Option D: etcd (embedded, 3+ servers)
+
+# Create external DB in another LXC/VM
+pct create 299 local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst \
+  --hostname k3s-db --memory 1024 --cores 1 --rootfs local-lvm:10
+
+# Install PostgreSQL inside DB container
+pct exec 299 -- apt-get update
+pct exec 299 -- apt-get install -y postgresql
+pct exec 299 -- sudo -u postgres psql -c "CREATE DATABASE k3s;"
+pct exec 299 -- sudo -u postgres psql -c "CREATE USER k3s WITH ENCRYPTED PASSWORD 'password';"
+pct exec 299 -- sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE k3s TO k3s;"
+```
+
+**Install first server:**
+```bash
+# On VM 301
+export K3S_DATASTORE_ENDPOINT="postgres://k3s:password@192.168.0.299:5432/k3s"
+export K3S_TOKEN="my-super-secret-token"
+
+curl -sfL https://get.k3s.io | sh -s - server \
+  --cluster-init \
+  --tls-san 192.168.0.301 \
+  --node-taint CriticalAddonsOnly=true:NoExecute
+```
+
+**Add additional servers:**
+```bash
+# On VM 302, 303
+export K3S_DATASTORE_ENDPOINT="postgres://k3s:password@192.168.0.299:5432/k3s"
+export K3S_TOKEN="my-super-secret-token"
+
+curl -sfL https://get.k3s.io | sh -s - server \
+  --server https://192.168.0.301:6443 \
+  --tls-san 192.168.0.302
+```
+
+**Add agents (workers):**
+```bash
+# On VM 304, 305
+export K3S_TOKEN="my-super-secret-token"
+curl -sfL https://get.k3s.io | sh -s - agent --server https://192.168.0.301:6443
+```
+
+### Option 4: k3d on Proxmox (K3s in Docker)
+
+Best for: Development, multi-cluster testing
+
+Requires: Docker installed (see "Docker on Proxmox" section)
+
+```bash
+# Inside Docker LXC or VM
+curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+# Create cluster
+k3d cluster create homelab \
+  --servers 1 \
+  --agents 2 \
+  --port 80:80@loadbalancer \
+  --port 443:443@loadbalancer
+
+# Use kubectl
+kubectl get nodes
+```
+
+### Deploying poll-modem on k3s
+
+**Option A: As a Deployment + Service**
+
+```yaml
+# poll-modem-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: poll-modem
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: poll-modem
+  template:
+    metadata:
+      labels:
+        app: poll-modem
+    spec:
+      containers:
+      - name: poll-modem
+        image: ghcr.io/go-go-golems/poll-modem:latest
+        args:
+          - "--url"
+          - "http://192.168.0.1"
+          - "--interval"
+          - "30s"
+        env:
+        - name: MODEM_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: modem-credentials
+              key: username
+        - name: MODEM_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: modem-credentials
+              key: password
+        volumeMounts:
+        - name: data
+          mountPath: /root/.config/poll-modem
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: poll-modem-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: poll-modem-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: modem-credentials
+type: Opaque
+stringData:
+  username: admin
+  password: yourpassword
+```
+
+**Apply:**
+```bash
+kubectl apply -f poll-modem-deployment.yaml
+```
+
+**Option B: As a CronJob (periodic polling)**
+
+```yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: poll-modem-collector
+spec:
+  schedule: "*/5 * * * *"  # Every 5 minutes
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: poll-modem
+            image: ghcr.io/go-go-golems/poll-modem:latest
+            args:
+              - "--url"
+              - "http://192.168.0.1"
+              - "--interval"
+              - "1m"
+              - "--export"
+              - "csv"
+            env:
+            - name: MODEM_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: modem-credentials
+                  key: username
+            - name: MODEM_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: modem-credentials
+                  key: password
+          restartPolicy: OnFailure
+```
+
+**Option C: Interactive TUI with tty access**
+
+For the interactive TUI mode, k3s isn't ideal (containers are headless). Use:
+- LXC native (recommended for TUI)
+- Or VM with direct SSH access
+
+### k3s vs Native LXC for poll-modem
+
+| Aspect | k3s (Kubernetes) | LXC Native |
+|--------|------------------|------------|
+| Complexity | Higher (YAML manifests) | Lower (direct binary) |
+| Orchestration | Excellent | Manual |
+| Scaling | Auto-scaling | Manual |
+| Self-healing | Pod restart on failure | systemd/restart script |
+| Persistence | PVCs required | Direct filesystem |
+| TUI Mode | ❌ Not suitable | ✅ Perfect |
+| Data Collection | ✅ CronJob ideal | ✅ systemd timer |
+| Resource Usage | Higher (K8s overhead) | Lower |
+| Learning Curve | Steep | Minimal |
+
+### Recommendation
+
+**For poll-modem specifically:**
+- **TUI mode**: Use LXC native (what we're doing)
+- **Data collection only**: Could use k3s CronJob
+- **Part of larger monitoring stack**: Use k3s with Prometheus/Grafana
+
+**For general homelab:**
+- Single node: k3s in one VM
+- HA setup: 3-server k3s cluster with external DB
+- Learning: k3d (k3s in Docker)
+
+### Useful k3s Commands
+
+```bash
+# Server management
+systemctl status k3s
+journalctl -u k3s -f
+
+# kubectl (included with k3s)
+kubectl get nodes
+kubectl get pods -A
+kubectl top nodes
+kubectl top pods
+
+# Config
+/etc/rancher/k3s/k3s.yaml  # kubeconfig
+/var/lib/rancher/k3s/      # data directory
+
+# Uninstall
+/usr/local/bin/k3s-uninstall.sh
+```
