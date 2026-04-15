@@ -341,3 +341,132 @@ Think of LXC as "lightweight VMs" and Docker as "packaged applications." For a m
 - Full OS environment for building
 
 LXC is the better fit, especially on Proxmox.
+
+---
+
+## Appendix: Can Proxmox Run Docker?
+
+Yes, Proxmox can run Docker containers, but there are several approaches with different trade-offs.
+
+### Option 1: Docker Inside LXC (Most Common)
+
+Run Docker containers inside an LXC container with nesting enabled.
+
+**Pros:**
+- Isolation from host
+- Multiple Docker environments per LXC
+- Easy backup/restore via Proxmox
+
+**Cons:**
+- Nested containers (complexity)
+- Slightly more overhead
+- Requires unprivileged container tweaks or privileged mode
+
+**Setup:**
+```bash
+# On Proxmox host - create privileged LXC for Docker
+pct create 200 local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst \
+  --hostname docker-host \
+  --memory 2048 \
+  --cores 2 \
+  --rootfs local-lvm:8 \
+  --net0 ip=dhcp,bridge=vmbr0 \
+  --unprivileged 0 \
+  --features nesting=1,keyctl=1
+
+# Inside LXC - install Docker
+curl -fsSL https://get.docker.com | sh
+```
+
+### Option 2: Docker on Proxmox Host (Not Recommended)
+
+Install Docker directly on the Proxmox host.
+
+**Pros:**
+- Direct hardware access
+- No nesting overhead
+
+**Cons:**
+- Breaks Proxmox support/warranty
+- Security risk (containers can access host)
+- Conflicts with Proxmox networking
+- Harder to backup/restore
+
+**Why it's not recommended:**
+Proxmox is designed as a hypervisor. Running Docker on the host violates the "hypervisor hygiene" principle and can cause networking conflicts with VMs/LXCs.
+
+### Option 3: Docker in a VM
+
+Create a Linux VM and run Docker inside it.
+
+**Pros:**
+- Full isolation
+- Any Linux distribution
+- Kubernetes-friendly
+
+**Cons:**
+- Higher overhead (full kernel)
+- More resource usage than LXC
+
+**When to use:**
+- Running Kubernetes clusters
+- Need specific kernel features
+- Maximum isolation required
+
+### Comparison Table
+
+| Approach | Overhead | Isolation | Backup | Complexity | Recommendation |
+|----------|----------|-----------|--------|------------|----------------|
+| Docker in LXC | Low | Good | Easy | Medium | ⭐ Good for home/lab |
+| Docker on host | Minimal | Poor | Hard | Low | ❌ Avoid in production |
+| Docker in VM | Higher | Excellent | Medium | Medium | ⭐ For K8s/production |
+| LXC native | Lowest | Good | Easy | Low | ⭐⭐ Best for Proxmox |
+
+### Our Choice: LXC Native
+
+For poll-modem, we chose **native LXC** over "Docker in LXC" because:
+
+1. **Simpler stack** - no nested containers
+2. **Lower overhead** - no Docker daemon
+3. **Direct Proxmox integration** - backups, monitoring, console access
+4. **Single process** - poll-modem doesn't need Docker's orchestration features
+5. **Persistent data** - SQLite is easier with direct filesystem access
+
+### When Would You Use Docker on Proxmox?
+
+Use "Docker in LXC" when:
+- You have multiple microservices to orchestrate
+- You need Docker Compose for app stacks
+- You want to run pre-built images from Docker Hub
+- You're migrating from a Docker-based workflow
+
+Use "Docker in VM" when:
+- Running production Kubernetes
+- Need specific kernel modules
+- Maximum isolation is critical
+
+### Quick Commands: Docker in LXC
+
+```bash
+# Create LXC for Docker (privileged required for now)
+pct create 200 local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst \
+  --hostname docker-host \
+  --memory 2048 \
+  --cores 2 \
+  --rootfs local-lvm:10 \
+  --net0 ip=dhcp,bridge=vmbr0 \
+  --unprivileged 0
+
+pct start 200
+
+# Install Docker inside
+pct exec 200 -- bash -c "curl -fsSL https://get.docker.com | sh"
+pct exec 200 -- usermod -aG docker root
+
+# Use Docker
+pct exec 200 -- docker run hello-world
+```
+
+### Summary
+
+Proxmox **can** run Docker, but it's typically done inside LXC or VMs rather than natively. For a single Go application like poll-modem, native LXC is simpler and more integrated. For multi-service apps, "Docker in LXC" gives you the best of both worlds.
