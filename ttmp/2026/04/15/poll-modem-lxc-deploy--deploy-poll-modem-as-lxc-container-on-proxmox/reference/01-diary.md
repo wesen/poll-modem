@@ -237,3 +237,107 @@ export MODEM_USER=admin MODEM_PASS=yourpassword
 bash /opt/poll-modem/scripts/run-in-tmux.sh
 tmux attach -t poll-modem
 ```
+
+---
+
+## Appendix: LXC vs Docker Containers
+
+Both LXC and Docker use Linux kernel features (cgroups, namespaces) for isolation, but they serve different purposes and have different architectures.
+
+### Core Differences
+
+| Aspect | LXC | Docker |
+|--------|-----|--------|
+| **Level** | OS-level virtualization | Application-level virtualization |
+| **Image** | Full OS rootfs (like a VM) | Layered filesystem with app + deps only |
+| **Init** | Runs init system (systemd) | Runs a single process (your app) |
+| **State** | Stateful "pet" containers | Stateless "cattle" containers |
+| **Network** | Full network stack (DHCP/static IP) | Port mapping / bridge networks |
+| **Storage** | Persistent by default | Ephemeral by default (volumes for persistence) |
+| **Kernel** | Shares host kernel | Shares host kernel |
+| **Overhead** | ~low (shares kernel) | ~very low (shares kernel, minimal userspace) |
+| **Use Case** | Long-running services, databases, apps needing init | Microservices, CI/CD, ephemeral workloads |
+
+### Architecture Comparison
+
+**LXC (System Container):**
+```
+Host Kernel
+    ↓
+LXC Container (like a lightweight VM)
+    ├── systemd (PID 1)
+    ├── sshd
+    ├── cron
+    ├── your apps
+    └── full OS userspace
+```
+
+**Docker (Application Container):**
+```
+Host Kernel
+    ↓
+Docker Container
+    └── Single process (your app)
+        └── may spawn child processes
+```
+
+### When to Use What
+
+**Use LXC when:**
+- You need a "VM-like" experience but lighter
+- Running long-lived services (databases, monitoring tools)
+- Need systemd/init system
+- Want persistent state by default
+- Running on Proxmox (native support)
+- You have a "pet" not "cattle" mentality
+- Need to SSH into the container and run multiple services
+
+**Use Docker when:**
+- Building microservices
+- Need fast startup/shutdown
+- Want immutable infrastructure
+- Running CI/CD pipelines
+- Need orchestration (Kubernetes, Swarm)
+- Sharing application images across teams
+- Running ephemeral workloads
+
+### Why LXC for poll-modem?
+
+We chose LXC because:
+1. **Proxmox native support** - Proxmox is built around LXC and KVM
+2. **TUI application** - poll-modem is interactive, needs tmux, persistent state
+3. **SQLite database** - needs persistent storage across restarts
+4. **Full OS environment** - easier to install Go, build from source, debug
+5. **"Pet" container** - this is a monitoring tool you care about, not a throwaway microservice
+6. **Network access** - needs to reach modem at 192.168.0.1 on same LAN
+
+### Commands Comparison
+
+| Task | LXC (Proxmox) | Docker |
+|------|---------------|--------|
+| Create | `pct create 100 ...` | `docker run -d ...` |
+| Enter | `pct exec 100 -- bash` | `docker exec -it ... bash` |
+| Start | `pct start 100` | `docker start ...` |
+| Stop | `pct stop 100` | `docker stop ...` |
+| Network | Direct DHCP/static IP | Port mapping (-p 8080:80) |
+| Storage | Persistent rootfs | Volumes (-v host:container) |
+| Logs | `pct exec 100 -- journalctl` | `docker logs ...` |
+
+### Proxmox LXC Specifics
+
+- **Unprivileged by default** - safer, runs as non-root UID
+- **Nesting enabled** - can run containers in containers
+- **Template-based** - uses pre-built OS templates (Debian, Ubuntu, Alpine)
+- **Web UI + API** - manage through Proxmox GUI or pvesh/pct CLI
+- **Backup/restore** - integrated with Proxmox backup system
+- **Resource limits** - CPU, memory, disk limits via cgroups
+
+### Summary
+
+Think of LXC as "lightweight VMs" and Docker as "packaged applications." For a monitoring tool like poll-modem that needs:
+- Long-running process
+- Persistent database
+- Interactive TUI
+- Full OS environment for building
+
+LXC is the better fit, especially on Proxmox.
