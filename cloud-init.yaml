@@ -11,6 +11,10 @@
 #   3. Import disk, attach, resize, boot (see scripts/create-k3s-vm.sh)
 #   4. After boot: tailscale up --auth-key=<key>
 
+ssh_authorized_keys:
+  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAUIiBSpybDlRj//fWLvidWpKU/s/zfhGNDi6wkwvtNU manuel@f
+  - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDnZnWSCVEMO9w9An7FO8GkFUU7q0Jen4/D7zNC1QTe0ksSUGwnUDhvzrPX6qxHrpRlkDiFNdzwgT+oFWccC/A8X5YPzTDFIcRyFTxuCbLXx9hCSATI2hMZamcDpEUaTlAy2It/ENhUvFAlvac0ukU4TWQ6BgxcZuUc4To5H8sEtLwX2DL+E6F3EID0APmq1Ypvb8t74NabhVIrxm0S1A9/Yp6Gew1K/oqEMHBeP6VtoDcJKkeC+NMGQBpmDJXix5oSZIgxDOGk1Aief0DQ5h/tbCFCAC50qLgTuhYitNKcwo13mPbK5g7tzijZcEWA32vQVZJwK2M25yr7GR93QraX root@pve
+
 package_update: true
 package_upgrade: true
 
@@ -33,6 +37,8 @@ write_files:
       tls-san:
         - k3s-server
         - k3s-server.tail879302.ts.net
+        - k3s-proxmox
+        - k3s-proxmox.tail879302.ts.net
 
   # --- Tailscale repo ---
   - path: /usr/share/keyrings/tailscale-archive-keyring.gpg
