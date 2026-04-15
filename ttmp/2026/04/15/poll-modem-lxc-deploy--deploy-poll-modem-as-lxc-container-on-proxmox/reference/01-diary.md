@@ -794,3 +794,168 @@ kubectl top pods
 # Uninstall
 /usr/local/bin/k3s-uninstall.sh
 ```
+
+---
+
+## Failed Attempt: k3s VM Setup Issues
+
+We attempted to create a k3s VM on Proxmox but encountered several issues that prevented successful deployment. Here's what went wrong:
+
+### What We Tried
+
+Created a QEMU VM with these specs:
+- VM ID: 300
+- Name: k3s-server
+- CPU: 4 cores, host type
+- Memory: 8192 MB
+- Disk: Imported debian-12-cloud.qcow2 (3GB)
+- Network: virtio, bridge vmbr0
+- Cloud-init: user=admin, password, SSH keys
+- IP: Static 192.168.0.210/24
+
+### Issues Encountered
+
+**1. Cloud Image Boot Issues**
+The Debian cloud image (debian-12-cloud.qcow2) had boot problems:
+```
+Error: Could not retrieve NBP file size from HTTP server.
+Error: Server response timeout.
+BdsDxe: failed to load Boot0004 "UEFI HTTPv4"
+```
+The VM tried to PXE boot instead of booting from the disk.
+
+**Root Cause:** The qcow2 image may not have been properly configured for direct boot, or required additional cloud-init configuration that wasn't provided during first boot.
+
+**2. Missing EFI Disk**
+Initially no EFI disk was configured. Fixed with:
+```bash
+qm set 300 --efidisk0 local-lvm:1
+```
+
+**3. SSH Not Accessible**
+Even after configuring network and cloud-init:
+- Port 22 was closed (not refused, but closed)
+- SSH service wasn't running
+- Cloud-init may not have completed
+
+**4. Serial Console Output Empty**
+Trying to access `/var/run/qemu-server/300.serial0` showed no boot output, suggesting:
+- Serial console not enabled in VM kernel
+- VM not reaching boot stage
+- Image compatibility issues
+
+**5. Disk Size**
+3GB Debian cloud image was minimal and may not have had space for cloud-init to complete properly.
+
+### Commands That Didn't Work
+
+```bash
+# SSH never connected
+ssh admin@192.168.0.210  # Connection refused or timeout
+
+# Serial console showed no output
+socat - UNIX-CONNECT:/var/run/qemu-server/300.serial0
+
+# Guest agent not installed in VM
+qm guest cmd 300 ping  # No QEMU guest agent configured
+```
+
+### Why This Approach Failed
+
+1. **Cloud image complexity**: Cloud images need proper cloud-init setup on first boot
+2. **No direct console access**: Hard to debug without working serial console
+3. **Missing guest agent**: Can't exec commands or check status from host
+4. **Boot order confusion**: EFI vs BIOS, SCSI vs SATA disk
+
+### What Would Have Worked Instead
+
+**Option A: LXC with Docker** (pivoting to this)
+- Faster startup
+- Easier to debug (pct exec works immediately)
+- No boot image issues
+- Can install k3s directly
+
+**Option B: VM with ISO Install**
+- Use Debian 12 ISO instead of cloud image
+- Manual install with proper partitioning
+- Then install k3s
+
+**Option C: Use the LXC k3s approach**
+- Privileged LXC with nesting
+- k3s installs directly
+- Less overhead than VM
+
+### Lessons Learned
+
+1. Cloud images are finicky without proper cloud-init infra
+2. VMs take longer to iterate on than LXC
+3. Serial console access is essential for debugging
+4. LXC is better for "pet" containers/VMs where you need quick access
+
+### Switching to LXC + Docker + k3s
+
+Abandoning VM approach in favor of LXC container with Docker and k3s.
+
+---
+
+## Step 5: k3s LXC Container Setup - In Progress
+
+We pivoted from the VM approach to an LXC container with k3s. This is a more lightweight and manageable approach.
+
+### What We Did
+
+**Created LXC container (ID 300):**
+```bash
+pct create 300 local:vztmpl/debian-12-standard_12.12-1_amd64.tar.zst \
+  --hostname k3s-server \
+  --memory 8192 \
+  --cores 4 \
+  --rootfs local-lvm:20 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.0.210/24 \
+  --nameserver 192.168.0.1 \
+  --unprivileged 0 \
+  --features nesting=1,keyctl=1,fuse=1 \
+  --start 1
+```
+
+**Issues encountered and resolved:**
+
+1. **SSH connection refused** - Multiple attempts to connect failed
+2. **Root cause found:** Stale ARP entry with wrong MAC address
+   - ARP table showed: `02:a3:b6:e3:b0:52` for 192.168.0.210
+   - Container had: `bc:24:11:04:78:92`
+   - **Fix:** `ip neigh flush 192.168.0.210`
+3. **Missing packages** - curl not installed, working on apt installation
+
+**Current status:**
+- Container running at 192.168.0.210
+- SSH working after ARP flush
+- Ping works to gateway and host
+- Installing prerequisites for k3s
+
+### Commands run
+```bash
+# Create container
+ssh root@pve "pct create 300 ..."
+
+# Fix ARP issue
+ssh root@pve "ip neigh flush 192.168.0.210"
+
+# Verify connectivity
+ssh root@pve "pct exec 300 -- ping -c 2 192.168.0.227"
+
+# Install packages (in progress)
+ssh root@pve "pct exec 300 -- apt-get update"
+ssh root@pve "pct exec 300 -- apt-get install -y curl wget git"
+```
+
+### What was tricky
+- ARP cache had stale entry from previous VM (ID 300)
+- The MAC address mismatch prevented all network traffic
+- Needed to flush ARP to force re-resolution
+
+### Next steps
+- Complete package installation
+- Install k3s
+- Install ArgoCD
+- Deploy poll-modem
