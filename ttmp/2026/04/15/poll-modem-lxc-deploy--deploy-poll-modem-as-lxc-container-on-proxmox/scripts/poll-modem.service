@@ -1,0 +1,19 @@
+[Unit]
+Description=Poll Modem TUI Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+Environment="HOME=/root"
+Environment="TERM=xterm-256color"
+
+# Run poll-modem in headless/data collection mode
+# For TUI mode, you would attach to the container and run interactively
+ExecStart=/usr/local/bin/poll-modem --url http://192.168.0.1 --interval 30s
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

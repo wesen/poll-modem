@@ -21,3 +21,6 @@ dist/
 .history
 .bin/
 poll-modem
+
+# Docmgr local config
+.ttmp.yaml
