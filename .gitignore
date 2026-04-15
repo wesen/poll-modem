@@ -24,3 +24,4 @@ poll-modem
 
 # Docmgr local config
 .ttmp.yaml
+kubeconfig.yaml
