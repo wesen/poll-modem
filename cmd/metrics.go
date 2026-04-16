@@ -22,6 +22,7 @@ type collectorMetrics struct {
 	registerOnce sync.Once
 }
 
+var metricsRegistry = prometheus.NewRegistry()
 var pollMetrics = newCollectorMetrics()
 
 func newCollectorMetrics() *collectorMetrics {
@@ -78,17 +79,17 @@ func newCollectorMetrics() *collectorMetrics {
 	}
 
 	m.registerOnce.Do(func() {
-		prometheus.MustRegister(prometheus.NewGoCollector())
-		prometheus.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
-		prometheus.MustRegister(m.pollsTotal)
-		prometheus.MustRegister(m.pollDuration)
-		prometheus.MustRegister(m.lastSuccessUnix)
-		prometheus.MustRegister(m.lastFailureUnix)
-		prometheus.MustRegister(m.lastErrorUnix)
-		prometheus.MustRegister(m.currentStatus)
-		prometheus.MustRegister(m.downstreamChannels)
-		prometheus.MustRegister(m.upstreamChannels)
-		prometheus.MustRegister(m.errorChannels)
+		metricsRegistry.MustRegister(prometheus.NewGoCollector())
+		metricsRegistry.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+		metricsRegistry.MustRegister(m.pollsTotal)
+		metricsRegistry.MustRegister(m.pollDuration)
+		metricsRegistry.MustRegister(m.lastSuccessUnix)
+		metricsRegistry.MustRegister(m.lastFailureUnix)
+		metricsRegistry.MustRegister(m.lastErrorUnix)
+		metricsRegistry.MustRegister(m.currentStatus)
+		metricsRegistry.MustRegister(m.downstreamChannels)
+		metricsRegistry.MustRegister(m.upstreamChannels)
+		metricsRegistry.MustRegister(m.errorChannels)
 	})
 
 	return m
