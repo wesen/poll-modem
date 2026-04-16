@@ -48,6 +48,13 @@ func (d *Database) Close() error {
 
 // getDatabasePath returns the path to the database file
 func getDatabasePath() (string, error) {
+	if dbPath := os.Getenv("POLL_MODEM_DB_PATH"); dbPath != "" {
+		if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {
+			return "", errors.Wrap(err, "failed to create database directory")
+		}
+		return dbPath, nil
+	}
+
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", errors.Wrap(err, "failed to get user home directory")

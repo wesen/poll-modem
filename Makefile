@@ -3,6 +3,8 @@
 all: gifs
 
 VERSION=v0.1.14
+IMAGE ?= ghcr.io/wesen/poll-modem
+IMAGE_TAG ?= latest
 GORELEASER_ARGS ?= --skip=sign --snapshot --clean
 GORELEASER_TARGET ?= --single-target
 GOLANGCI_LINT_VERSION ?= $(shell cat .golangci-lint-version)
@@ -47,6 +49,15 @@ build:
 
 goreleaser:
 	GOWORK=off goreleaser release $(GORELEASER_ARGS) $(GORELEASER_TARGET)
+
+docker-build:
+	docker build -t $(IMAGE):$(IMAGE_TAG) -t $(IMAGE):$(VERSION) .
+
+docker-push: docker-build
+	docker push $(IMAGE):$(IMAGE_TAG)
+	docker push $(IMAGE):$(VERSION)
+
+publish-ghcr: docker-push
 
 tag-major:
 	git tag $(shell svu major)
