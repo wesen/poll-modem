@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-go-golems/poll-modem/internal/modem"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 )
@@ -59,8 +60,10 @@ func (c *modemCollector) Close() error {
 }
 
 func (c *modemCollector) Poll(ctx context.Context) error {
+	start := time.Now()
 	info, err := c.client.LoginAndFetch(ctx)
 	if err != nil {
+		pollMetrics.observeFailure(time.Since(start))
 		c.mu.Lock()
 		c.snapshot.LastError = err.Error()
 		c.mu.Unlock()
@@ -68,11 +71,14 @@ func (c *modemCollector) Poll(ctx context.Context) error {
 	}
 
 	if err := c.db.StoreModemInfo(c.sessionID, info); err != nil {
+		pollMetrics.observeFailure(time.Since(start))
 		c.mu.Lock()
 		c.snapshot.LastError = err.Error()
 		c.mu.Unlock()
 		return err
 	}
+
+	pollMetrics.observeSuccess(time.Since(start), info)
 
 	c.mu.Lock()
 	c.snapshot.LastSuccess = time.Now()
@@ -143,6 +149,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}()
 
 	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
